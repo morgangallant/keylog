@@ -1,2 +1,3 @@
-# keylog
-A simple tool to monitor and report daily keystroke counts.
+__keylog__ is a simple tool used to monitor the number of keystrokes performed on a machine. It was built as a way to better understand personal productivity patterns, and _should not_ be used for nefarious purposes. Right now, the tool is incredibly simplistic and only supports linux. Please feel free to add MacOS/Windows support.
+
+In terms of usage, the intended workflow is for this tool to be run as some sort of systemd job, and post counts to an endpoint of your choice every x hours. As per usage, you can get help by passing the `--help` flag to the binary. I made a conscious choice to force the user to enter a custom endpoint for post requests, since we wouldn't want the site owners of `example.com` getting too angry with us :) 
