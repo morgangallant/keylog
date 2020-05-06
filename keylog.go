@@ -203,7 +203,6 @@ func (k *Keylogger) Run() error {
 		k.mu.Lock()
 		k.count++
 		k.mu.Unlock()
-		log.Println("pressed")
 	}
 	for _, logger := range k.loggers {
 		if err := logger.Finish(); err != nil {
