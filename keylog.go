@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -21,7 +20,7 @@ import (
 const (
 	DefaultEndpoint           = "https://example.com/wh/keylog"
 	DefaultDevice             = "default"
-	DefaultReportingFrequency = 12
+	DefaultReportingFrequency = 1
 )
 
 var (
@@ -30,16 +29,38 @@ var (
 	frequency = flag.Int("frequency", DefaultReportingFrequency, "The frequency of reports (hours).")
 )
 
+func FindDevices() []string {
+	path, resolved := "/sys/class/input/event%d/device/name", "/dev/input/event%d"
+	devices := []string{}
+	for i := 0; i < 255; i++ {
+		buf, err := ioutil.ReadFile(fmt.Sprintf(path, i))
+		if err != nil {
+			break
+		}
+		if strings.Contains(strings.ToLower(string(buf)), "keyboard") {
+			devices = append(devices, fmt.Sprintf(resolved, i))
+		}
+	}
+	return devices
+}
+
+func IsRoot() bool {
+	return syscall.Getuid() == 0 && syscall.Geteuid() == 0
+}
+
 func main() {
 	flag.Parse()
 	if *endpoint == DefaultEndpoint {
 		log.Fatalf("reporting endpoint not set, terminating")
 	}
-	path, err := FindDevicePath()
-	if err != nil {
-		log.Fatalf("failed to resolve keyboard device: %v", err)
+	if !IsRoot() {
+		log.Fatalln("must be root to run the keylogger")
 	}
-	logger, err := NewKeylogger(path)
+	devices := FindDevices()
+	if len(devices) == 0 {
+		log.Fatalln("zero input devices found, terminating")
+	}
+	logger, err := NewKeylogger(devices)
 	if err != nil {
 		log.Fatalf("failed to create keylogger: %v", err)
 	}
@@ -52,46 +73,93 @@ func main() {
 			}
 		}
 	}()
-	if err := logger.Start(); err != nil {
+	if err := logger.Run(); err != nil {
 		log.Printf("logger unexpectedly terminated: %v", err)
 	}
 }
 
-// note that this will return the first keyboard device, does not support multiple keyboards
-func FindDevicePath() (string, error) {
-	path, resolved := "/sys/class/input/event%d/device/name", "/dev/input/event%d"
-	for i := 0; i < 255; i++ {
-		buf, err := ioutil.ReadFile(fmt.Sprintf(path, i))
-		if err != nil {
-			return "", err
-		}
-		if strings.Contains(strings.ToLower(string(buf)), "keyboard") {
-			log.Printf("using keyboard: %d", i)
-			return fmt.Sprintf(resolved, i), nil
-		}
-	}
-	return "", errors.New("not found")
+type Timestamp struct {
+	Seconds      uint64
+	Microseconds uint64
 }
 
-type Keylogger struct {
-	sync.Mutex
-	count int64
-	fd    *os.File
+type InputEvent struct {
+	Time  Timestamp
+	Type  uint16
+	Code  uint16
+	Value int32
 }
 
-func IsRoot() bool {
-	return syscall.Getuid() == 0 && syscall.Geteuid() == 0
+func (i *InputEvent) IsKeyPress() bool {
+	return i.Value == 1
 }
 
-func NewKeylogger(devpath string) (*Keylogger, error) {
-	if !IsRoot() {
-		return nil, errors.New("must be run as root")
-	}
-	fd, err := os.Open(devpath)
+var InputEventSize = int(unsafe.Sizeof(InputEvent{}))
+
+type DeviceLogger struct {
+	fd   *os.File
+	out  chan InputEvent
+	done chan struct{}
+}
+
+func NewDeviceLogger(device string, out chan InputEvent) (*DeviceLogger, error) {
+	fd, err := os.OpenFile(device, os.O_RDONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
-	return &Keylogger{fd: fd}, nil
+	return &DeviceLogger{
+		fd:   fd,
+		out:  out,
+		done: make(chan struct{}),
+	}, nil
+}
+
+func (d *DeviceLogger) Run() {
+	event, buffer := InputEvent{}, make([]byte, InputEventSize)
+	for {
+		n, err := d.fd.Read(buffer)
+		if err != nil {
+			return
+		}
+		if n != InputEventSize {
+			continue
+		}
+		event.Time.Seconds = binary.LittleEndian.Uint64(buffer[0:8])
+		event.Time.Microseconds = binary.LittleEndian.Uint64(buffer[8:16])
+		event.Type = binary.LittleEndian.Uint16(buffer[16:18])
+		event.Code = binary.LittleEndian.Uint16(buffer[18:20])
+		event.Value = int32(binary.LittleEndian.Uint32(buffer[20:24]))
+		select {
+		case <-d.done:
+			return
+		case d.out <- event:
+			// fallthrough
+		}
+	}
+}
+
+func (d *DeviceLogger) Finish() error {
+	close(d.done)
+	return d.fd.Close()
+}
+
+type Keylogger struct {
+	mu       sync.Mutex
+	count    int64
+	incoming chan InputEvent
+	loggers  []*DeviceLogger
+}
+
+func NewKeylogger(devices []string) (*Keylogger, error) {
+	loggers, out := []*DeviceLogger{}, make(chan InputEvent, 1)
+	for _, device := range devices {
+		logger, err := NewDeviceLogger(device, out)
+		if err != nil {
+			return nil, err
+		}
+		loggers = append(loggers, logger)
+	}
+	return &Keylogger{incoming: out, loggers: loggers}, nil
 }
 
 type KeylogReport struct {
@@ -101,8 +169,8 @@ type KeylogReport struct {
 }
 
 func (k *Keylogger) Report() error {
-	k.Lock()
-	defer k.Unlock()
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	report := KeylogReport{
 		Keystrokes: k.count,
 		DeviceName: *device,
@@ -124,41 +192,27 @@ func (k *Keylogger) Report() error {
 	return nil
 }
 
-type InputEvent struct {
-	Time  syscall.Timeval
-	Type  uint16
-	Code  uint16
-	Value int32
-}
-
-func (i *InputEvent) IsKeyPress() bool {
-	return i.Value == 1
-}
-
-func (k *Keylogger) Start() error {
-	bufsize := int(unsafe.Sizeof(InputEvent{}))
-	buf, event := make([]byte, bufsize), &InputEvent{}
-	for {
-		n, err := k.fd.Read(buf)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			time.Sleep(time.Millisecond * 20)
+func (k *Keylogger) Run() error {
+	for _, logger := range k.loggers {
+		go logger.Run()
+	}
+	for event := range k.incoming {
+		if !event.IsKeyPress() {
 			continue
 		}
-		log.Printf("N=%d", n)
-		err = binary.Read(bytes.NewBuffer(buf), binary.LittleEndian, event)
-		if err != nil {
+		k.mu.Lock()
+		k.count++
+		k.mu.Unlock()
+		log.Println("pressed")
+	}
+	for _, logger := range k.loggers {
+		if err := logger.Finish(); err != nil {
 			return err
 		}
-		if event.IsKeyPress() {
-			k.Lock()
-			k.count++
-			log.Println("pressed")
-			k.Unlock()
-		}
-		log.Println("here")
-		buf, event = buf[:0], &InputEvent{}
 	}
+	return nil
+}
+
+func (k *Keylogger) Finish() {
+	close(k.incoming)
 }
